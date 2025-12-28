@@ -104,7 +104,12 @@ class ChatterboxTTS:
         
         # Create ONNX sessions with optimizations
         _LOGGER.info("Creating ONNX inference sessions...")
+        
+        # Suppress ONNX Runtime warnings
+        onnxruntime.set_default_logger_severity(3)  # 3 = Error, suppresses warnings
+        
         sess_options = onnxruntime.SessionOptions()
+        sess_options.log_severity_level = 3  # 3 = Error
         sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         sess_options.intra_op_num_threads = 4
         sess_options.inter_op_num_threads = 4
