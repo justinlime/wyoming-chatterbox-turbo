@@ -47,9 +47,8 @@ class RepetitionPenaltyLogitsProcessor:
     def __call__(self, input_ids: np.ndarray, scores: np.ndarray) -> np.ndarray:
         score = np.take_along_axis(scores, input_ids, axis=1)
         score = np.where(score < 0, score * self.penalty, score / self.penalty)
-        scores_processed = scores.copy()
-        np.put_along_axis(scores_processed, input_ids, score, axis=1)
-        return scores_processed
+        np.put_along_axis(scores, input_ids, score, axis=1)
+        return scores
 
 
 class ChatterboxTTS:
@@ -59,12 +58,20 @@ class ChatterboxTTS:
         self.dtype = dtype
         self.voices_dir = Path(voices_dir)
         self.voices: Dict[str, np.ndarray] = {}
+        self.voice_cache: Dict[str, tuple] = {}  # Cache encoded voices
         self.tokenizer = None
         self.use_cuda = use_cuda
         
         # Configure execution providers for ONNX
         if self.use_cuda:
-            self.providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            self.providers = [
+                ('CUDAExecutionProvider', {
+                    'arena_extend_strategy': 'kSameAsRequested',
+                    'cudnn_conv_algo_search': 'DEFAULT',
+                    'do_copy_in_default_stream': True,
+                }),
+                'CPUExecutionProvider'
+            ]
             _LOGGER.info("CUDA acceleration enabled")
         else:
             self.providers = ['CPUExecutionProvider']
@@ -95,10 +102,13 @@ class ChatterboxTTS:
         embed_tokens_path = self.download_model("embed_tokens")
         language_model_path = self.download_model("language_model")
         
-        # Create ONNX sessions
+        # Create ONNX sessions with optimizations
         _LOGGER.info("Creating ONNX inference sessions...")
         sess_options = onnxruntime.SessionOptions()
         sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = 4
+        sess_options.inter_op_num_threads = 4
+        sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
         
         self.speech_encoder_session = onnxruntime.InferenceSession(
             speech_encoder_path, 
@@ -120,6 +130,17 @@ class ChatterboxTTS:
             sess_options=sess_options,
             providers=self.providers
         )
+        
+        # Warm up models
+        if self.use_cuda:
+            _LOGGER.info("Warming up GPU models...")
+            dummy_audio = np.zeros((1, SAMPLE_RATE), dtype=np.float32)
+            dummy_ids = np.array([[1, 2, 3]], dtype=np.int64)
+            try:
+                self.speech_encoder_session.run(None, {"audio_values": dummy_audio})
+                self.embed_tokens_session.run(None, {"input_ids": dummy_ids})
+            except Exception as e:
+                _LOGGER.debug(f"Warmup failed (expected): {e}")
         
         # Log which provider is actually being used
         for name, session in [
@@ -158,6 +179,11 @@ class ChatterboxTTS:
                     voice_name = audio_file.stem
                     self.voices[voice_name] = audio_values
                     
+                    # Pre-encode voice for faster synthesis
+                    _LOGGER.info(f"Pre-encoding voice: {voice_name}")
+                    encoded = self.speech_encoder_session.run(None, {"audio_values": audio_values})
+                    self.voice_cache[voice_name] = encoded
+                    
                     _LOGGER.info(f"Loaded voice: {voice_name} ({audio_file.name})")
                 except Exception as e:
                     _LOGGER.error(f"Failed to load {audio_file.name}: {e}")
@@ -189,8 +215,8 @@ class ChatterboxTTS:
         
         _LOGGER.info(f"Synthesizing with voice '{voice_name}': {text[:50]}...")
         
-        # Get reference audio for this voice
-        audio_values = self.voices[voice_name]
+        # Get cached voice encoding
+        cond_emb, prompt_token, speaker_embeddings, speaker_features = self.voice_cache[voice_name]
         
         # Tokenize text
         input_ids = self.tokenizer(text, return_tensors="np")["input_ids"].astype(np.int64)
@@ -199,50 +225,50 @@ class ChatterboxTTS:
         repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
         generate_tokens = np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
         
+        # Embed text tokens once
+        inputs_embeds = self.embed_tokens_session.run(None, {"input_ids": input_ids})[0]
+        inputs_embeds = np.concatenate((cond_emb, inputs_embeds), axis=1)
+        
+        # Initialize cache and LLM inputs
+        batch_size, seq_len, _ = inputs_embeds.shape
+        past_key_values = {
+            inp.name: np.zeros(
+                [batch_size, NUM_KV_HEADS, 0, HEAD_DIM],
+                dtype=np.float16 if inp.type == 'tensor(float16)' else np.float32
+            )
+            for inp in self.language_model_session.get_inputs()
+            if "past_key_values" in inp.name
+        }
+        attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
+        position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+        
         for i in range(max_new_tokens):
-            inputs_embeds = self.embed_tokens_session.run(None, {"input_ids": input_ids})[0]
-            
-            if i == 0:
-                # First iteration: encode reference audio
-                ort_speech_encoder_input = {"audio_values": audio_values}
-                cond_emb, prompt_token, speaker_embeddings, speaker_features = \
-                    self.speech_encoder_session.run(None, ort_speech_encoder_input)
-                inputs_embeds = np.concatenate((cond_emb, inputs_embeds), axis=1)
-                
-                # Initialize cache and LLM inputs
-                batch_size, seq_len, _ = inputs_embeds.shape
-                past_key_values = {
-                    inp.name: np.zeros(
-                        [batch_size, NUM_KV_HEADS, 0, HEAD_DIM],
-                        dtype=np.float16 if inp.type == 'tensor(float16)' else np.float32
-                    )
-                    for inp in self.language_model_session.get_inputs()
-                    if "past_key_values" in inp.name
-                }
-                attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
-                position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1).repeat(batch_size, axis=0)
-            
             # Run language model
-            logits, *present_key_values = self.language_model_session.run(None, dict(
+            outputs = self.language_model_session.run(None, dict(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 **past_key_values,
             ))
             
+            logits = outputs[0]
+            present_key_values = outputs[1:]
+            
             # Apply repetition penalty and sample next token
             logits = logits[:, -1, :]
             next_token_logits = repetition_penalty_processor(generate_tokens, logits)
-            input_ids = np.argmax(next_token_logits, axis=-1, keepdims=True).astype(np.int64)
-            generate_tokens = np.concatenate((generate_tokens, input_ids), axis=-1)
+            next_token = np.argmax(next_token_logits, axis=-1, keepdims=True).astype(np.int64)
+            generate_tokens = np.concatenate((generate_tokens, next_token), axis=-1)
             
             # Check for stop token
-            if (input_ids.flatten() == STOP_SPEECH_TOKEN).all():
+            if next_token[0, 0] == STOP_SPEECH_TOKEN:
                 break
             
-            # Update for next iteration
+            # Update for next iteration - only embed the new token
+            inputs_embeds = self.embed_tokens_session.run(None, {"input_ids": next_token})[0]
             attention_mask = np.concatenate([attention_mask, np.ones((batch_size, 1), dtype=np.int64)], axis=1)
             position_ids = position_ids[:, -1:] + 1
+            
             for j, key in enumerate(past_key_values):
                 past_key_values[key] = present_key_values[j]
         
