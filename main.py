@@ -388,16 +388,16 @@ async def main():
         help="Directory containing voice reference audio files (default: ./voices, env: VOICES_DIR)"
     )
     parser.add_argument(
-        "--dtype",
-        default=os.environ.get("DTYPE", "fp32"),
-        choices=["fp32", "fp16", "q8", "q4", "q4f16"],
-        help="Model data type (default: fp32, env: DTYPE)"
-    )
-    parser.add_argument(
         "--cuda",
         action="store_true",
         default=os.environ.get("CUDA", "").lower() in ("1", "true", "yes"),
         help="Use CUDA GPU acceleration (default: False, env: CUDA)"
+    )
+    parser.add_argument(
+        "--dtype",
+        default=None,
+        choices=["fp32", "q8", "q4"],
+        help="Model data type - fp32 for GPU, q8/q4 for CPU (default: auto-select based on CUDA, env: DTYPE)"
     )
     parser.add_argument(
         "--log-level",
@@ -407,6 +407,13 @@ async def main():
     )
     
     args = parser.parse_args()
+    
+    # Auto-select dtype if not specified
+    if args.dtype is None:
+        args.dtype = os.environ.get("DTYPE")
+        if args.dtype is None:
+            args.dtype = "fp32" if args.cuda else "q4"
+            _LOGGER.info(f"Auto-selected dtype: {args.dtype}")
     
     # Configure logging
     logging.basicConfig(
