@@ -99,6 +99,8 @@ class AudioPostProcessor:
         if not self.enabled or audio is None or len(audio) == 0:
             return audio
         
+        start_time = time.time()
+        
         # Ensure float32 for consistent processing
         processed = audio.astype(np.float32, copy=True)
         
@@ -118,6 +120,10 @@ class AudioPostProcessor:
         peak = np.abs(processed).max()
         if peak > 1e-6:  # Avoid division by zero
             processed = processed * (self.target_peak / peak)
+        
+        processing_time = (time.time() - start_time) * 1000
+        if processing_time > 10:  # Log if processing takes > 10ms
+            _LOGGER.warning(f"Post-processing took {processing_time:.1f}ms for {len(audio)/self.sample_rate:.2f}s audio")
         
         return processed
 
@@ -379,19 +385,27 @@ class ChatterboxTTS:
         start_time = time.time()
         _LOGGER.debug(f"Synthesizing chunk with voice '{voice_name}': {text[:50]}...")
         
+        timing = {}  # Track timing for each stage
+        
         # Get cached voice encoding
+        stage_start = time.time()
         cond_emb, prompt_token, speaker_embeddings, speaker_features = self.voice_cache[voice_name]
+        timing['voice_cache_lookup'] = time.time() - stage_start
         
         # Tokenize text
+        stage_start = time.time()
         input_ids = self.tokenizer(text, return_tensors="np")["input_ids"].astype(np.int64)
+        timing['tokenization'] = time.time() - stage_start
         
         # Generation loop
+        stage_start = time.time()
         repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
         generate_tokens = np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
         
         # Embed text tokens once
         inputs_embeds = self.embed_tokens_session.run(None, {"input_ids": input_ids})[0]
         inputs_embeds = np.concatenate((cond_emb, inputs_embeds), axis=1)
+        timing['text_embedding'] = time.time() - stage_start
         
         # Initialize cache and LLM inputs
         batch_size, seq_len, _ = inputs_embeds.shape
@@ -459,10 +473,18 @@ class ChatterboxTTS:
         audio_duration = len(wav) / SAMPLE_RATE
         rtf = audio_duration / total_time if total_time > 0 else 0
         
+        # Log detailed timing breakdown
         _LOGGER.info(
             f"Generated {audio_duration:.2f}s audio in {total_time:.2f}s "
             f"(RTF: {rtf:.2f}x, {tokens_generated} tokens in {token_gen_time:.2f}s, "
             f"decode: {decode_time:.2f}s)"
+        )
+        _LOGGER.debug(
+            f"Timing breakdown: voice_cache={timing.get('voice_cache_lookup', 0)*1000:.1f}ms, "
+            f"tokenize={timing.get('tokenization', 0)*1000:.1f}ms, "
+            f"embed={timing.get('text_embedding', 0)*1000:.1f}ms, "
+            f"generate={token_gen_time*1000:.1f}ms, "
+            f"decode={decode_time*1000:.1f}ms"
         )
         
         return wav
@@ -521,15 +543,24 @@ class ChatterboxEventHandler(AsyncEventHandler):
                 async def send_audio():
                     nonlocal first_chunk_sent, total_audio_duration
                     
+                    chunks_sent = 0
+                    last_chunk_time = time.time()
+                    
                     while True:
-                        # Non-blocking check for audio chunks
-                        try:
-                            wav_chunk = await asyncio.to_thread(audio_queue.get, timeout=0.1)
-                        except queue.Empty:
-                            continue
+                        # Block until data is available (no timeout needed - sentinel handles termination)
+                        wav_chunk = await asyncio.to_thread(audio_queue.get)
                         
                         if wav_chunk is None:  # Sentinel for end
                             break
+                        
+                        # Track inter-chunk delay
+                        now = time.time()
+                        if chunks_sent > 0:
+                            inter_chunk_delay = (now - last_chunk_time) * 1000
+                            if inter_chunk_delay > 100:  # Log delays > 100ms
+                                _LOGGER.warning(f"Inter-chunk delay: {inter_chunk_delay:.1f}ms (chunk {chunks_sent})")
+                        last_chunk_time = now
+                        chunks_sent += 1
                         
                         # Convert to 16-bit PCM (already post-processed by the engine)
                         wav_int16 = (wav_chunk * 32767).astype(np.int16)
