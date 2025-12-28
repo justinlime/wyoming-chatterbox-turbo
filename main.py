@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import time
 from functools import partial
 from pathlib import Path
 from typing import Dict, Optional
@@ -274,6 +275,7 @@ class ChatterboxTTS:
         repetition_penalty: float = 1.2
     ) -> np.ndarray:
         """Internal method to synthesize a single text chunk"""
+        start_time = time.time()
         _LOGGER.debug(f"Synthesizing chunk with voice '{voice_name}': {text[:50]}...")
         
         # Get cached voice encoding
@@ -303,6 +305,9 @@ class ChatterboxTTS:
         attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
         position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
         
+        token_gen_start = time.time()
+        tokens_generated = 0
+        
         for i in range(max_new_tokens):
             # Run language model
             outputs = self.language_model_session.run(None, dict(
@@ -320,6 +325,7 @@ class ChatterboxTTS:
             next_token_logits = repetition_penalty_processor(generate_tokens, logits)
             next_token = np.argmax(next_token_logits, axis=-1, keepdims=True).astype(np.int64)
             generate_tokens = np.concatenate((generate_tokens, next_token), axis=-1)
+            tokens_generated += 1
             
             # Check for stop token
             if next_token[0, 0] == STOP_SPEECH_TOKEN:
@@ -333,7 +339,10 @@ class ChatterboxTTS:
             for j, key in enumerate(past_key_values):
                 past_key_values[key] = present_key_values[j]
         
+        token_gen_time = time.time() - token_gen_start
+        
         # Decode audio from tokens
+        decode_start = time.time()
         speech_tokens = generate_tokens[:, 1:-1]
         silence_tokens = np.full((speech_tokens.shape[0], 3), SILENCE_TOKEN, dtype=np.int64)
         speech_tokens = np.concatenate([prompt_token, speech_tokens, silence_tokens], axis=1)
@@ -343,6 +352,17 @@ class ChatterboxTTS:
             speaker_embeddings=speaker_embeddings,
             speaker_features=speaker_features,
         ))[0].squeeze(axis=0)
+        
+        decode_time = time.time() - decode_start
+        total_time = time.time() - start_time
+        audio_duration = len(wav) / SAMPLE_RATE
+        rtf = audio_duration / total_time if total_time > 0 else 0
+        
+        _LOGGER.info(
+            f"Generated {audio_duration:.2f}s audio in {total_time:.2f}s "
+            f"(RTF: {rtf:.2f}x, {tokens_generated} tokens in {token_gen_time:.2f}s, "
+            f"decode: {decode_time:.2f}s)"
+        )
         
         return wav
 
@@ -380,6 +400,8 @@ class ChatterboxEventHandler(AsyncEventHandler):
                 return False
             
             try:
+                synthesis_start = time.time()
+                
                 # Send audio start event immediately for low latency perception
                 await self.write_event(
                     AudioStart(
@@ -388,6 +410,8 @@ class ChatterboxEventHandler(AsyncEventHandler):
                         channels=1
                     ).event()
                 )
+                
+                first_chunk_sent = False
                 
                 # Synthesize audio in background thread
                 wav = await asyncio.to_thread(
@@ -411,9 +435,21 @@ class ChatterboxEventHandler(AsyncEventHandler):
                             audio=chunk.tobytes()
                         ).event()
                     )
+                    
+                    if not first_chunk_sent:
+                        ttfb = time.time() - synthesis_start
+                        _LOGGER.info(f"First audio chunk sent in {ttfb:.3f}s (TTFB)")
+                        first_chunk_sent = True
                 
                 # Send audio stop event
                 await self.write_event(AudioStop().event())
+                
+                total_time = time.time() - synthesis_start
+                audio_duration = len(wav) / SAMPLE_RATE
+                _LOGGER.info(
+                    f"Complete synthesis: {audio_duration:.2f}s audio, "
+                    f"{total_time:.2f}s total, RTF: {audio_duration/total_time:.2f}x"
+                )
                 _LOGGER.debug("Audio streaming complete")
                 
             except Exception as e:
