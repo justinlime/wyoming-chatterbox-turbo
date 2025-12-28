@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Wyoming Protocol TTS Server for Chatterbox-Turbo
-Home Assistant compatible real-time text-to-speech service
+Home Assistant compatible real-time text-to-speech service with audio post-processing
 """
 import argparse
 import asyncio
@@ -28,6 +28,13 @@ from wyoming.server import AsyncEventHandler, AsyncServer
 from wyoming.tts import Synthesize
 from wyoming.info import Describe
 
+# Optional scipy for audio filters
+try:
+    from scipy import signal
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 # Model constants
 MODEL_ID = "ResembleAI/chatterbox-turbo-ONNX"
 SAMPLE_RATE = 24000
@@ -38,6 +45,81 @@ NUM_KV_HEADS = 16
 HEAD_DIM = 64
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class AudioPostProcessor:
+    """
+    Lightweight audio post-processing for TTS output.
+    
+    Applies minimal overhead processing (~5-10ms per chunk):
+    - High-pass filter (removes DC offset and low-frequency rumble)
+    - Soft clipping (prevents harsh distortion)
+    - Peak normalization (consistent volume levels)
+    """
+    
+    def __init__(
+        self,
+        sample_rate: int = SAMPLE_RATE,
+        highpass_cutoff: float = 80.0,
+        target_peak: float = 0.95,
+    ):
+        """
+        Initialize audio post-processor with sane defaults.
+        
+        Args:
+            sample_rate: Sample rate of audio (default: 24000 Hz)
+            highpass_cutoff: High-pass filter cutoff in Hz (default: 80 Hz)
+            target_peak: Target peak normalization level (default: 0.95)
+        """
+        self.sample_rate = sample_rate
+        self.target_peak = target_peak
+        self.enabled = True
+        
+        # Pre-compute high-pass filter coefficients if scipy available
+        if SCIPY_AVAILABLE:
+            nyquist = sample_rate / 2
+            normalized_cutoff = highpass_cutoff / nyquist
+            self.hp_b, self.hp_a = signal.butter(2, normalized_cutoff, btype='high')
+            _LOGGER.info(f"Audio post-processing enabled: {highpass_cutoff}Hz HPF, {target_peak} peak")
+        else:
+            self.hp_b = None
+            self.hp_a = None
+            _LOGGER.warning("SciPy not available - high-pass filter disabled")
+    
+    def process(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Apply post-processing to audio chunk.
+        
+        Args:
+            audio: Input audio (float32, -1.0 to 1.0)
+            
+        Returns:
+            Processed audio (float32)
+        """
+        if not self.enabled or audio is None or len(audio) == 0:
+            return audio
+        
+        # Ensure float32 for consistent processing
+        processed = audio.astype(np.float32, copy=True)
+        
+        # 1. High-pass filter (remove DC offset and rumble)
+        if SCIPY_AVAILABLE and self.hp_b is not None:
+            try:
+                # Use filtfilt for zero-phase filtering (no delay)
+                processed = signal.filtfilt(self.hp_b, self.hp_a, processed).astype(np.float32)
+            except Exception as e:
+                _LOGGER.debug(f"High-pass filter failed: {e}")
+        
+        # 2. Soft clipping (prevents harsh distortion)
+        # Tanh-based soft limiter with gentle knee
+        processed = np.tanh(processed * 1.2) * 0.9
+        
+        # 3. Peak normalization (consistent volume)
+        peak = np.abs(processed).max()
+        if peak > 1e-6:  # Avoid division by zero
+            processed = processed * (self.target_peak / peak)
+        
+        return processed
 
 
 class RepetitionPenaltyLogitsProcessor:
@@ -65,6 +147,9 @@ class ChatterboxTTS:
         self.tokenizer = None
         self.use_cuda = use_cuda
         self.max_text_length = 200  # Keep chunks small for consistent VRAM usage
+        
+        # Audio post-processor (initialized after we know sample rate)
+        self.post_processor = AudioPostProcessor(sample_rate=SAMPLE_RATE)
         
         # Configure execution providers for ONNX
         if self.use_cuda:
@@ -262,6 +347,10 @@ class ChatterboxTTS:
             for i, sentence in enumerate(sentences):
                 _LOGGER.debug(f"Processing chunk {i+1}/{len(sentences)}: {sentence[:50]}...")
                 chunk_audio = self._synthesize_chunk(sentence, voice_name, max_new_tokens, repetition_penalty)
+                
+                # Apply post-processing
+                chunk_audio = self.post_processor.process(chunk_audio)
+                
                 stream_callback(chunk_audio)
         else:
             # Buffered mode - concatenate all chunks
@@ -269,6 +358,10 @@ class ChatterboxTTS:
             for i, sentence in enumerate(sentences):
                 _LOGGER.debug(f"Processing chunk {i+1}/{len(sentences)}: {sentence[:50]}...")
                 chunk_audio = self._synthesize_chunk(sentence, voice_name, max_new_tokens, repetition_penalty)
+                
+                # Apply post-processing
+                chunk_audio = self.post_processor.process(chunk_audio)
+                
                 audio_chunks.append(chunk_audio)
             
             wav = np.concatenate(audio_chunks)
@@ -438,7 +531,7 @@ class ChatterboxEventHandler(AsyncEventHandler):
                         if wav_chunk is None:  # Sentinel for end
                             break
                         
-                        # Convert to 16-bit PCM
+                        # Convert to 16-bit PCM (already post-processed by the engine)
                         wav_int16 = (wav_chunk * 32767).astype(np.int16)
                         total_audio_duration += len(wav_int16) / SAMPLE_RATE
                         
@@ -467,7 +560,7 @@ class ChatterboxEventHandler(AsyncEventHandler):
                 def queue_callback(wav_chunk):
                     audio_queue.put(wav_chunk)
                 
-                # Synthesize in background
+                # Synthesize in background (post-processing applied inside synthesize())
                 await asyncio.to_thread(
                     self.tts_engine.synthesize,
                     synthesize.text,
