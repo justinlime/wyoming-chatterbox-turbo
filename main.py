@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 from functools import partial
 from pathlib import Path
@@ -61,6 +62,7 @@ class ChatterboxTTS:
         self.voice_cache: Dict[str, tuple] = {}  # Cache encoded voices
         self.tokenizer = None
         self.use_cuda = use_cuda
+        self.max_text_length = 200  # Keep chunks small for consistent VRAM usage
         
         # Configure execution providers for ONNX
         if self.use_cuda:
@@ -114,6 +116,11 @@ class ChatterboxTTS:
         sess_options.intra_op_num_threads = 4
         sess_options.inter_op_num_threads = 4
         sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+        
+        if self.use_cuda:
+            sess_options.enable_mem_pattern = False  # Reduce memory fragmentation
+            sess_options.enable_cpu_mem_arena = False
+            sess_options.enable_mem_reuse = True  # Aggressive memory reuse
         
         self.speech_encoder_session = onnxruntime.InferenceSession(
             speech_encoder_path, 
@@ -196,6 +203,28 @@ class ChatterboxTTS:
         if not self.voices:
             _LOGGER.warning("No voices loaded. Add .wav files to voices directory.")
     
+    def split_into_sentences(self, text: str) -> list[str]:
+        """Split text into sentences for memory-efficient processing"""
+        # Split on sentence boundaries
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        
+        # Merge very short sentences to avoid too many chunks
+        merged = []
+        current = ""
+        
+        for sentence in sentences:
+            if len(current) + len(sentence) <= self.max_text_length:
+                current = (current + " " + sentence).strip()
+            else:
+                if current:
+                    merged.append(current)
+                current = sentence
+        
+        if current:
+            merged.append(current)
+        
+        return merged if merged else [text]
+    
     def synthesize(
         self,
         text: str,
@@ -218,7 +247,34 @@ class ChatterboxTTS:
         if voice_name not in self.voices:
             raise ValueError(f"Voice '{voice_name}' not found. Available: {list(self.voices.keys())}")
         
-        _LOGGER.info(f"Synthesizing with voice '{voice_name}': {text[:50]}...")
+        # Split long text into sentences to reduce VRAM usage
+        sentences = self.split_into_sentences(text)
+        
+        if len(sentences) > 1:
+            _LOGGER.info(f"Split text into {len(sentences)} chunks for memory efficiency")
+            audio_chunks = []
+            
+            for i, sentence in enumerate(sentences):
+                _LOGGER.debug(f"Processing chunk {i+1}/{len(sentences)}: {sentence[:50]}...")
+                chunk_audio = self._synthesize_chunk(sentence, voice_name, max_new_tokens, repetition_penalty)
+                audio_chunks.append(chunk_audio)
+            
+            # Concatenate all audio chunks
+            wav = np.concatenate(audio_chunks)
+            _LOGGER.info(f"Synthesized {len(wav) / SAMPLE_RATE:.2f}s total audio from {len(sentences)} chunks")
+            return wav
+        else:
+            return self._synthesize_chunk(text, voice_name, max_new_tokens, repetition_penalty)
+    
+    def _synthesize_chunk(
+        self,
+        text: str,
+        voice_name: str,
+        max_new_tokens: int = 1024,
+        repetition_penalty: float = 1.2
+    ) -> np.ndarray:
+        """Internal method to synthesize a single text chunk"""
+        _LOGGER.debug(f"Synthesizing chunk with voice '{voice_name}': {text[:50]}...")
         
         # Get cached voice encoding
         cond_emb, prompt_token, speaker_embeddings, speaker_features = self.voice_cache[voice_name]
@@ -288,7 +344,6 @@ class ChatterboxTTS:
             speaker_features=speaker_features,
         ))[0].squeeze(axis=0)
         
-        _LOGGER.info(f"Synthesized {len(wav) / SAMPLE_RATE:.2f}s of audio")
         return wav
 
 
