@@ -19,6 +19,7 @@ import numpy as np
 import onnxruntime
 import librosa
 import soundfile as sf
+from scipy import signal
 from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
@@ -27,13 +28,6 @@ from wyoming.info import Attribution, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
 from wyoming.tts import Synthesize
 from wyoming.info import Describe
-
-# Optional scipy for audio filters
-try:
-    from scipy import signal
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
 
 # Model constants
 MODEL_ID = "ResembleAI/chatterbox-turbo-ONNX"
@@ -64,7 +58,7 @@ class AudioPostProcessor:
         target_peak: float = 0.95,
     ):
         """
-        Initialize audio post-processor with sane defaults.
+        Initialize audio post-processor.
         
         Args:
             sample_rate: Sample rate of audio (default: 24000 Hz)
@@ -75,55 +69,30 @@ class AudioPostProcessor:
         self.target_peak = target_peak
         self.enabled = True
         
-        # Pre-compute high-pass filter coefficients if scipy available
-        if SCIPY_AVAILABLE:
-            nyquist = sample_rate / 2
-            normalized_cutoff = highpass_cutoff / nyquist
-            self.hp_b, self.hp_a = signal.butter(2, normalized_cutoff, btype='high')
-            _LOGGER.info(f"Audio post-processing enabled: {highpass_cutoff}Hz HPF, {target_peak} peak")
-        else:
-            self.hp_b = None
-            self.hp_a = None
-            _LOGGER.warning("SciPy not available - high-pass filter disabled")
+        # Pre-compute high-pass filter coefficients
+        nyquist = sample_rate / 2
+        normalized_cutoff = highpass_cutoff / nyquist
+        self.hp_b, self.hp_a = signal.butter(2, normalized_cutoff, btype='high')
+        _LOGGER.info(f"Audio post-processing enabled: {highpass_cutoff}Hz HPF, {target_peak} peak")
     
     def process(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Apply post-processing to audio chunk.
-        
-        Args:
-            audio: Input audio (float32, -1.0 to 1.0)
-            
-        Returns:
-            Processed audio (float32)
-        """
+        """Apply post-processing to audio chunk."""
         if not self.enabled or audio is None or len(audio) == 0:
             return audio
-        
-        start_time = time.time()
         
         # Ensure float32 for consistent processing
         processed = audio.astype(np.float32, copy=True)
         
         # 1. High-pass filter (remove DC offset and rumble)
-        if SCIPY_AVAILABLE and self.hp_b is not None:
-            try:
-                # Use filtfilt for zero-phase filtering (no delay)
-                processed = signal.filtfilt(self.hp_b, self.hp_a, processed).astype(np.float32)
-            except Exception as e:
-                _LOGGER.debug(f"High-pass filter failed: {e}")
+        processed = signal.filtfilt(self.hp_b, self.hp_a, processed).astype(np.float32)
         
         # 2. Soft clipping (prevents harsh distortion)
-        # Tanh-based soft limiter with gentle knee
         processed = np.tanh(processed * 1.2) * 0.9
         
         # 3. Peak normalization (consistent volume)
         peak = np.abs(processed).max()
-        if peak > 1e-6:  # Avoid division by zero
+        if peak > 1e-6:
             processed = processed * (self.target_peak / peak)
-        
-        processing_time = (time.time() - start_time) * 1000
-        if processing_time > 10:  # Log if processing takes > 10ms
-            _LOGGER.warning(f"Post-processing took {processing_time:.1f}ms for {len(audio)/self.sample_rate:.2f}s audio")
         
         return processed
 
@@ -149,12 +118,11 @@ class ChatterboxTTS:
         self.dtype = dtype
         self.voices_dir = Path(voices_dir)
         self.voices: Dict[str, np.ndarray] = {}
-        self.voice_cache: Dict[str, tuple] = {}  # Cache encoded voices
+        self.voice_cache: Dict[str, tuple] = {}
         self.tokenizer = None
         self.use_cuda = use_cuda
-        self.max_text_length = 200  # Keep chunks small for consistent VRAM usage
+        self.max_text_length = 200
         
-        # Audio post-processor (initialized after we know sample rate)
         self.post_processor = AudioPostProcessor(sample_rate=SAMPLE_RATE)
         
         # Configure execution providers for ONNX
@@ -200,20 +168,19 @@ class ChatterboxTTS:
         # Create ONNX sessions with optimizations
         _LOGGER.info("Creating ONNX inference sessions...")
         
-        # Suppress ONNX Runtime warnings
-        onnxruntime.set_default_logger_severity(3)  # 3 = Error, suppresses warnings
+        onnxruntime.set_default_logger_severity(3)
         
         sess_options = onnxruntime.SessionOptions()
-        sess_options.log_severity_level = 3  # 3 = Error
+        sess_options.log_severity_level = 3
         sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         sess_options.intra_op_num_threads = 4
         sess_options.inter_op_num_threads = 4
         sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
         
         if self.use_cuda:
-            sess_options.enable_mem_pattern = False  # Reduce memory fragmentation
+            sess_options.enable_mem_pattern = False
             sess_options.enable_cpu_mem_arena = False
-            sess_options.enable_mem_reuse = True  # Aggressive memory reuse
+            sess_options.enable_mem_reuse = True
         
         self.speech_encoder_session = onnxruntime.InferenceSession(
             speech_encoder_path, 
@@ -247,16 +214,6 @@ class ChatterboxTTS:
             except Exception as e:
                 _LOGGER.debug(f"Warmup failed (expected): {e}")
         
-        # Log which provider is actually being used
-        for name, session in [
-            ("speech_encoder", self.speech_encoder_session),
-            ("embed_tokens", self.embed_tokens_session),
-            ("language_model", self.language_model_session),
-            ("cond_decoder", self.cond_decoder_session)
-        ]:
-            provider = session.get_providers()[0]
-            _LOGGER.debug(f"{name} using: {provider}")
-        
         # Load tokenizer
         _LOGGER.info("Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -276,15 +233,12 @@ class ChatterboxTTS:
         for audio_file in self.voices_dir.iterdir():
             if audio_file.suffix.lower() in audio_extensions:
                 try:
-                    # Load audio and resample to model sample rate
                     audio_values, _ = librosa.load(str(audio_file), sr=SAMPLE_RATE)
                     audio_values = audio_values[np.newaxis, :].astype(np.float32)
                     
-                    # Use filename without extension as voice name
                     voice_name = audio_file.stem
                     self.voices[voice_name] = audio_values
                     
-                    # Pre-encode voice for faster synthesis
                     _LOGGER.info(f"Pre-encoding voice: {voice_name}")
                     encoded = self.speech_encoder_session.run(None, {"audio_values": audio_values})
                     self.voice_cache[voice_name] = encoded
@@ -298,10 +252,8 @@ class ChatterboxTTS:
     
     def split_into_sentences(self, text: str) -> list[str]:
         """Split text into sentences for memory-efficient processing"""
-        # Split on sentence boundaries
         sentences = re.split(r'(?<=[.!?])\s+', text.strip())
         
-        # Merge very short sentences to avoid too many chunks
         merged = []
         current = ""
         
@@ -331,7 +283,7 @@ class ChatterboxTTS:
         
         Args:
             text: Text to synthesize
-            voice_name: Name of voice to use (must exist in self.voices)
+            voice_name: Name of voice to use
             max_new_tokens: Maximum tokens to generate
             repetition_penalty: Penalty for repeating tokens
             stream_callback: Optional callback(audio_chunk) for streaming output
@@ -342,32 +294,23 @@ class ChatterboxTTS:
         if voice_name not in self.voices:
             raise ValueError(f"Voice '{voice_name}' not found. Available: {list(self.voices.keys())}")
         
-        # Split long text into sentences to reduce VRAM usage
         sentences = self.split_into_sentences(text)
         
         if len(sentences) > 1:
             _LOGGER.info(f"Split text into {len(sentences)} chunks for memory efficiency")
         
         if stream_callback:
-            # Streaming mode - yield each chunk as it's generated
             for i, sentence in enumerate(sentences):
                 _LOGGER.debug(f"Processing chunk {i+1}/{len(sentences)}: {sentence[:50]}...")
                 chunk_audio = self._synthesize_chunk(sentence, voice_name, max_new_tokens, repetition_penalty)
-                
-                # Apply post-processing
                 chunk_audio = self.post_processor.process(chunk_audio)
-                
                 stream_callback(chunk_audio)
         else:
-            # Buffered mode - concatenate all chunks
             audio_chunks = []
             for i, sentence in enumerate(sentences):
                 _LOGGER.debug(f"Processing chunk {i+1}/{len(sentences)}: {sentence[:50]}...")
                 chunk_audio = self._synthesize_chunk(sentence, voice_name, max_new_tokens, repetition_penalty)
-                
-                # Apply post-processing
                 chunk_audio = self.post_processor.process(chunk_audio)
-                
                 audio_chunks.append(chunk_audio)
             
             wav = np.concatenate(audio_chunks)
@@ -385,27 +328,21 @@ class ChatterboxTTS:
         start_time = time.time()
         _LOGGER.debug(f"Synthesizing chunk with voice '{voice_name}': {text[:50]}...")
         
-        timing = {}  # Track timing for each stage
-        
         # Get cached voice encoding
-        stage_start = time.time()
         cond_emb, prompt_token, speaker_embeddings, speaker_features = self.voice_cache[voice_name]
-        timing['voice_cache_lookup'] = time.time() - stage_start
         
         # Tokenize text
-        stage_start = time.time()
         input_ids = self.tokenizer(text, return_tensors="np")["input_ids"].astype(np.int64)
-        timing['tokenization'] = time.time() - stage_start
         
         # Generation loop
-        stage_start = time.time()
         repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
-        generate_tokens = np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
+        
+        # Use Python list instead of repeatedly concatenating numpy arrays
+        generate_tokens_list = [START_SPEECH_TOKEN]
         
         # Embed text tokens once
         inputs_embeds = self.embed_tokens_session.run(None, {"input_ids": input_ids})[0]
         inputs_embeds = np.concatenate((cond_emb, inputs_embeds), axis=1)
-        timing['text_embedding'] = time.time() - stage_start
         
         # Initialize cache and LLM inputs
         batch_size, seq_len, _ = inputs_embeds.shape
@@ -433,28 +370,38 @@ class ChatterboxTTS:
             ))
             
             logits = outputs[0]
-            present_key_values = outputs[1:]
             
             # Apply repetition penalty and sample next token
             logits = logits[:, -1, :]
-            next_token_logits = repetition_penalty_processor(generate_tokens, logits)
+            
+            # Convert to array only when needed for penalty calculation
+            generate_tokens_array = np.array([generate_tokens_list], dtype=np.int64)
+            next_token_logits = repetition_penalty_processor(generate_tokens_array, logits)
             next_token = np.argmax(next_token_logits, axis=-1, keepdims=True).astype(np.int64)
-            generate_tokens = np.concatenate((generate_tokens, next_token), axis=-1)
+            next_token_scalar = int(next_token[0, 0])
+            generate_tokens_list.append(next_token_scalar)
             tokens_generated += 1
             
             # Check for stop token
-            if next_token[0, 0] == STOP_SPEECH_TOKEN:
+            if next_token_scalar == STOP_SPEECH_TOKEN:
                 break
             
-            # Update for next iteration - only embed the new token
+            # Update KV cache BEFORE deleting outputs
+            for j, key in enumerate(past_key_values):
+                past_key_values[key] = outputs[j + 1]
+            
+            # Explicitly delete large objects to free memory immediately
+            del outputs, logits, next_token_logits, generate_tokens_array
+            
+            # Update for next iteration
             inputs_embeds = self.embed_tokens_session.run(None, {"input_ids": next_token})[0]
             attention_mask = np.concatenate([attention_mask, np.ones((batch_size, 1), dtype=np.int64)], axis=1)
             position_ids = position_ids[:, -1:] + 1
-            
-            for j, key in enumerate(past_key_values):
-                past_key_values[key] = present_key_values[j]
         
         token_gen_time = time.time() - token_gen_start
+        
+        # Convert token list to array for decoding
+        generate_tokens = np.array([generate_tokens_list], dtype=np.int64)
         
         # Decode audio from tokens
         decode_start = time.time()
@@ -468,23 +415,19 @@ class ChatterboxTTS:
             speaker_features=speaker_features,
         ))[0].squeeze(axis=0)
         
+        # Clean up all large objects before returning
+        del generate_tokens, generate_tokens_list, speech_tokens, silence_tokens
+        del past_key_values, inputs_embeds, attention_mask, position_ids
+        
         decode_time = time.time() - decode_start
         total_time = time.time() - start_time
         audio_duration = len(wav) / SAMPLE_RATE
         rtf = audio_duration / total_time if total_time > 0 else 0
         
-        # Log detailed timing breakdown
         _LOGGER.info(
             f"Generated {audio_duration:.2f}s audio in {total_time:.2f}s "
             f"(RTF: {rtf:.2f}x, {tokens_generated} tokens in {token_gen_time:.2f}s, "
             f"decode: {decode_time:.2f}s)"
-        )
-        _LOGGER.debug(
-            f"Timing breakdown: voice_cache={timing.get('voice_cache_lookup', 0)*1000:.1f}ms, "
-            f"tokenize={timing.get('tokenization', 0)*1000:.1f}ms, "
-            f"embed={timing.get('text_embedding', 0)*1000:.1f}ms, "
-            f"generate={token_gen_time*1000:.1f}ms, "
-            f"decode={decode_time*1000:.1f}ms"
         )
         
         return wav
@@ -508,7 +451,6 @@ class ChatterboxEventHandler(AsyncEventHandler):
     async def handle_event(self, event: Event) -> bool:
         """Process incoming Wyoming events"""
         if Describe.is_type(event.type):
-            # Send server info in response to describe request
             await self.write_event(self.wyoming_info_event)
             return True
         
@@ -516,7 +458,6 @@ class ChatterboxEventHandler(AsyncEventHandler):
             synthesize = Synthesize.from_event(event)
             _LOGGER.debug(f"Received synthesis request: {synthesize.text}")
             
-            # Determine which voice to use
             voice_name = synthesize.voice.name if synthesize.voice else self.default_voice
             if not voice_name:
                 _LOGGER.error("No voice specified and no default voice available")
@@ -527,7 +468,6 @@ class ChatterboxEventHandler(AsyncEventHandler):
                 first_chunk_sent = False
                 total_audio_duration = 0
                 
-                # Send audio start event immediately
                 await self.write_event(
                     AudioStart(
                         rate=SAMPLE_RATE,
@@ -536,37 +476,20 @@ class ChatterboxEventHandler(AsyncEventHandler):
                     ).event()
                 )
                 
-                # Thread-safe queue for passing audio between threads
                 audio_queue = queue.Queue()
                 
-                # Audio sender task
                 async def send_audio():
                     nonlocal first_chunk_sent, total_audio_duration
                     
-                    chunks_sent = 0
-                    last_chunk_time = time.time()
-                    
                     while True:
-                        # Block until data is available (no timeout needed - sentinel handles termination)
                         wav_chunk = await asyncio.to_thread(audio_queue.get)
                         
-                        if wav_chunk is None:  # Sentinel for end
+                        if wav_chunk is None:
                             break
                         
-                        # Track inter-chunk delay
-                        now = time.time()
-                        if chunks_sent > 0:
-                            inter_chunk_delay = (now - last_chunk_time) * 1000
-                            if inter_chunk_delay > 100:  # Log delays > 100ms
-                                _LOGGER.warning(f"Inter-chunk delay: {inter_chunk_delay:.1f}ms (chunk {chunks_sent})")
-                        last_chunk_time = now
-                        chunks_sent += 1
-                        
-                        # Convert to 16-bit PCM (already post-processed by the engine)
                         wav_int16 = (wav_chunk * 32767).astype(np.int16)
                         total_audio_duration += len(wav_int16) / SAMPLE_RATE
                         
-                        # Stream in small chunks
                         chunk_size = 1024
                         for i in range(0, len(wav_int16), chunk_size):
                             chunk = wav_int16[i:i + chunk_size]
@@ -584,14 +507,11 @@ class ChatterboxEventHandler(AsyncEventHandler):
                                 _LOGGER.info(f"First audio chunk sent in {ttfb:.3f}s (TTFB)")
                                 first_chunk_sent = True
                 
-                # Start sender task
                 sender_task = asyncio.create_task(send_audio())
                 
-                # Callback to queue audio chunks (thread-safe)
                 def queue_callback(wav_chunk):
                     audio_queue.put(wav_chunk)
                 
-                # Synthesize in background (post-processing applied inside synthesize())
                 await asyncio.to_thread(
                     self.tts_engine.synthesize,
                     synthesize.text,
@@ -599,11 +519,9 @@ class ChatterboxEventHandler(AsyncEventHandler):
                     stream_callback=queue_callback
                 )
                 
-                # Signal end and wait for sender to finish
                 audio_queue.put(None)
                 await sender_task
                 
-                # Send audio stop event
                 await self.write_event(AudioStop().event())
                 
                 total_time = time.time() - synthesis_start
@@ -611,7 +529,6 @@ class ChatterboxEventHandler(AsyncEventHandler):
                     f"Complete synthesis: {total_audio_duration:.2f}s audio, "
                     f"{total_time:.2f}s total, RTF: {total_audio_duration/total_time:.2f}x"
                 )
-                _LOGGER.debug("Audio streaming complete")
                 
             except Exception as e:
                 _LOGGER.error(f"Synthesis failed: {e}", exc_info=True)
@@ -660,14 +577,12 @@ async def main():
     
     args = parser.parse_args()
     
-    # Auto-select dtype if not specified
     if args.dtype is None:
         args.dtype = os.environ.get("DTYPE")
         if args.dtype is None:
             args.dtype = "fp32" if args.cuda else "q4"
             _LOGGER.info(f"Auto-selected dtype: {args.dtype}")
     
-    # Configure logging
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -678,7 +593,6 @@ async def main():
     _LOGGER.info("Wyoming Chatterbox TTS Server")
     _LOGGER.info("=" * 60)
     
-    # Check CUDA availability if requested
     if args.cuda:
         cuda_available = 'CUDAExecutionProvider' in onnxruntime.get_available_providers()
         if not cuda_available:
@@ -687,7 +601,6 @@ async def main():
         else:
             _LOGGER.info("CUDA is available and will be used for acceleration")
     
-    # Initialize TTS engine
     tts_engine = ChatterboxTTS(
         dtype=args.dtype,
         voices_dir=args.voices_dir,
@@ -705,7 +618,6 @@ async def main():
         _LOGGER.error("No voices available. Cannot start server.")
         return 1
     
-    # Build Wyoming info
     voices = [
         TtsVoice(
             name=name,
@@ -716,7 +628,7 @@ async def main():
             ),
             installed=True,
             version="1.0.0",
-            languages=["en"]  # Chatterbox supports English
+            languages=["en"]
         )
         for name in tts_engine.voices.keys()
     ]
@@ -737,13 +649,11 @@ async def main():
         ]
     )
     
-    # Start Wyoming server
     _LOGGER.info(f"Starting server on {args.host}:{args.port}")
     _LOGGER.info(f"Available voices: {', '.join(tts_engine.voices.keys())}")
     
     server = AsyncServer.from_uri(f"tcp://{args.host}:{args.port}")
     
-    # Use partial to bind custom parameters, leaving reader/writer for Wyoming
     await server.run(partial(
         ChatterboxEventHandler,
         tts_engine,

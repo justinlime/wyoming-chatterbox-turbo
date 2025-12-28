@@ -11,4 +11,5 @@ dependencies = [
     "numpy",
     "librosa",
     "soundfile",
+    "scipy"
 ]
