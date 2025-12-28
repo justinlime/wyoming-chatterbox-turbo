@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import logging
 import os
+import queue
 import re
 import sys
 import time
@@ -231,8 +232,9 @@ class ChatterboxTTS:
         text: str,
         voice_name: str,
         max_new_tokens: int = 1024,
-        repetition_penalty: float = 1.2
-    ) -> np.ndarray:
+        repetition_penalty: float = 1.2,
+        stream_callback = None
+    ):
         """
         Synthesize speech from text using specified voice
         
@@ -241,9 +243,10 @@ class ChatterboxTTS:
             voice_name: Name of voice to use (must exist in self.voices)
             max_new_tokens: Maximum tokens to generate
             repetition_penalty: Penalty for repeating tokens
+            stream_callback: Optional callback(audio_chunk) for streaming output
             
         Returns:
-            Audio waveform as numpy array
+            Audio waveform as numpy array (only if stream_callback is None)
         """
         if voice_name not in self.voices:
             raise ValueError(f"Voice '{voice_name}' not found. Available: {list(self.voices.keys())}")
@@ -253,19 +256,24 @@ class ChatterboxTTS:
         
         if len(sentences) > 1:
             _LOGGER.info(f"Split text into {len(sentences)} chunks for memory efficiency")
+        
+        if stream_callback:
+            # Streaming mode - yield each chunk as it's generated
+            for i, sentence in enumerate(sentences):
+                _LOGGER.debug(f"Processing chunk {i+1}/{len(sentences)}: {sentence[:50]}...")
+                chunk_audio = self._synthesize_chunk(sentence, voice_name, max_new_tokens, repetition_penalty)
+                stream_callback(chunk_audio)
+        else:
+            # Buffered mode - concatenate all chunks
             audio_chunks = []
-            
             for i, sentence in enumerate(sentences):
                 _LOGGER.debug(f"Processing chunk {i+1}/{len(sentences)}: {sentence[:50]}...")
                 chunk_audio = self._synthesize_chunk(sentence, voice_name, max_new_tokens, repetition_penalty)
                 audio_chunks.append(chunk_audio)
             
-            # Concatenate all audio chunks
             wav = np.concatenate(audio_chunks)
             _LOGGER.info(f"Synthesized {len(wav) / SAMPLE_RATE:.2f}s total audio from {len(sentences)} chunks")
             return wav
-        else:
-            return self._synthesize_chunk(text, voice_name, max_new_tokens, repetition_penalty)
     
     def _synthesize_chunk(
         self,
@@ -401,54 +409,83 @@ class ChatterboxEventHandler(AsyncEventHandler):
             
             try:
                 synthesis_start = time.time()
+                first_chunk_sent = False
+                total_audio_duration = 0
                 
-                # Send audio start event immediately for low latency perception
+                # Send audio start event immediately
                 await self.write_event(
                     AudioStart(
                         rate=SAMPLE_RATE,
-                        width=2,  # 16-bit = 2 bytes
+                        width=2,
                         channels=1
                     ).event()
                 )
                 
-                first_chunk_sent = False
+                # Thread-safe queue for passing audio between threads
+                audio_queue = queue.Queue()
                 
-                # Synthesize audio in background thread
-                wav = await asyncio.to_thread(
+                # Audio sender task
+                async def send_audio():
+                    nonlocal first_chunk_sent, total_audio_duration
+                    
+                    while True:
+                        # Non-blocking check for audio chunks
+                        try:
+                            wav_chunk = await asyncio.to_thread(audio_queue.get, timeout=0.1)
+                        except queue.Empty:
+                            continue
+                        
+                        if wav_chunk is None:  # Sentinel for end
+                            break
+                        
+                        # Convert to 16-bit PCM
+                        wav_int16 = (wav_chunk * 32767).astype(np.int16)
+                        total_audio_duration += len(wav_int16) / SAMPLE_RATE
+                        
+                        # Stream in small chunks
+                        chunk_size = 1024
+                        for i in range(0, len(wav_int16), chunk_size):
+                            chunk = wav_int16[i:i + chunk_size]
+                            await self.write_event(
+                                AudioChunk(
+                                    rate=SAMPLE_RATE,
+                                    width=2,
+                                    channels=1,
+                                    audio=chunk.tobytes()
+                                ).event()
+                            )
+                            
+                            if not first_chunk_sent:
+                                ttfb = time.time() - synthesis_start
+                                _LOGGER.info(f"First audio chunk sent in {ttfb:.3f}s (TTFB)")
+                                first_chunk_sent = True
+                
+                # Start sender task
+                sender_task = asyncio.create_task(send_audio())
+                
+                # Callback to queue audio chunks (thread-safe)
+                def queue_callback(wav_chunk):
+                    audio_queue.put(wav_chunk)
+                
+                # Synthesize in background
+                await asyncio.to_thread(
                     self.tts_engine.synthesize,
                     synthesize.text,
-                    voice_name
+                    voice_name,
+                    stream_callback=queue_callback
                 )
                 
-                # Convert to 16-bit PCM
-                wav_int16 = (wav * 32767).astype(np.int16)
-                
-                # Stream audio in small chunks for responsive playback
-                chunk_size = 1024  # Small chunks for lower latency
-                for i in range(0, len(wav_int16), chunk_size):
-                    chunk = wav_int16[i:i + chunk_size]
-                    await self.write_event(
-                        AudioChunk(
-                            rate=SAMPLE_RATE,
-                            width=2,
-                            channels=1,
-                            audio=chunk.tobytes()
-                        ).event()
-                    )
-                    
-                    if not first_chunk_sent:
-                        ttfb = time.time() - synthesis_start
-                        _LOGGER.info(f"First audio chunk sent in {ttfb:.3f}s (TTFB)")
-                        first_chunk_sent = True
+                # Signal end and wait for sender to finish
+                audio_queue.put(None)
+                await sender_task
                 
                 # Send audio stop event
                 await self.write_event(AudioStop().event())
                 
                 total_time = time.time() - synthesis_start
-                audio_duration = len(wav) / SAMPLE_RATE
                 _LOGGER.info(
-                    f"Complete synthesis: {audio_duration:.2f}s audio, "
-                    f"{total_time:.2f}s total, RTF: {audio_duration/total_time:.2f}x"
+                    f"Complete synthesis: {total_audio_duration:.2f}s audio, "
+                    f"{total_time:.2f}s total, RTF: {total_audio_duration/total_time:.2f}x"
                 )
                 _LOGGER.debug("Audio streaming complete")
                 
